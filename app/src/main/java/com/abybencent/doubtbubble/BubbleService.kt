@@ -3,10 +3,6 @@ package com.abybencent.doubtbubble
 import android.accessibilityservice.AccessibilityService
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -44,8 +40,6 @@ import kotlin.math.max
 class BubbleService : AccessibilityService() {
 
     companion object {
-        private const val CHANNEL_ID = "bubble"
-        private const val NOTIF_ID = 1
         private const val MAX_IMAGE_SIDE = 1600
         private const val MAX_TEXT_CHARS = 12000
 
@@ -73,8 +67,7 @@ class BubbleService : AccessibilityService() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         instance = this
         createBubble()
-        createChannel()
-        postNotification()
+        Notifier.post(this)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) { /* not needed */ }
@@ -97,7 +90,7 @@ class BubbleService : AccessibilityService() {
         hideTrash()
         bubble?.takeIf { it.isAttachedToWindow }?.let { runCatching { wm.removeView(it) } }
         bubble = null
-        getSystemService(NotificationManager::class.java)?.cancel(NOTIF_ID)
+        Notifier.cancel(this)
     }
 
     private fun screenSize(): Pair<Int, Int> {
@@ -411,43 +404,5 @@ class BubbleService : AccessibilityService() {
         params.x = (cx - v.width / 2f).toInt() - offX
         params.y = (cy - v.height / 2f).toInt() - offY
         wm.updateViewLayout(v, params)
-    }
-
-    // ---------- Notification ----------
-
-    private fun createChannel() {
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Doubt Bubble", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Tap to bring up the doubt bubble"
-                setShowBadge(false)
-            }
-        )
-    }
-
-    private fun postNotification() {
-        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        val show = PendingIntent.getActivity(
-            this, 2,
-            Intent(this, ShowBubbleActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            flags
-        )
-        val off = PendingIntent.getActivity(
-            this, 1,
-            Intent(this, ShowBubbleActivity::class.java)
-                .setAction(ShowBubbleActivity.ACTION_TURN_OFF)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            flags
-        )
-        val n = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notify)
-            .setContentTitle("Got a doubt?")
-            .setContentText("Tap to bring up the bubble")
-            .setContentIntent(show)
-            .setOngoing(true)
-            .setShowWhen(false)
-            .addAction(Notification.Action.Builder(null, "Show bubble", show).build())
-            .addAction(Notification.Action.Builder(null, "Turn off", off).build())
-            .build()
-        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, n) }
     }
 }

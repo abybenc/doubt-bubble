@@ -111,6 +111,8 @@ class MainActivity : Activity() {
                 "• Drag it anywhere else and it sticks to the nearest edge.\n" +
                 "• Tap the small screenshot in the chat to see what was captured.\n" +
                 "• Apps that block screenshots (banking, some news/streaming apps) still work: it reads their text instead.\n" +
+                "• The notification comes back by itself after you restart your phone. If it doesn't, " +
+                "set Doubt Bubble's Battery to \"Unrestricted\" (Fix greyed-out switch → Battery).\n" +
                 "• To switch everything off, tap Turn off in the notification.",
             14f, color = "#555A6B", top = 4
         ))
