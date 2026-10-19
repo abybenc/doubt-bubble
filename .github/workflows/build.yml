@@ -1,0 +1,68 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # One-time bootstrap: the project was uploaded from the browser as a tarball.
+      - name: Unpack uploaded project
+        if: hashFiles('project.tar.gz') != ''
+        run: |
+          tar xzf project.tar.gz
+          git rm -q project.tar.gz
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Unpack project files"
+          git push
+
+      - name: Check project is present
+        id: check
+        run: |
+          if [ -f settings.gradle.kts ]; then echo "ready=true" >> "$GITHUB_OUTPUT"; else echo "No project yet, skipping build."; fi
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build APK
+        if: steps.check.outputs.ready == 'true'
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        if: steps.check.outputs.ready == 'true'
+        run: cp app/build/outputs/apk/debug/app-debug.apk DoubtBubble.apk
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          name: DoubtBubble
+          path: DoubtBubble.apk
+
+      - name: Publish to Releases (latest)
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest DoubtBubble.apk \
+            --target "$SHA" \
+            --title "Doubt Bubble (latest build)" \
+            --notes "Download DoubtBubble.apk on your phone and install it. Built from ${SHA::7}."
