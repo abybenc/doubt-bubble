@@ -144,7 +144,7 @@ class ChatActivity : Activity() {
                 panelLp.topMargin = if (keyboardOpen) bars.top + gap else maxOf(bars.top + gap, (h * 0.26).toInt())
                 panelLp.bottomMargin = maxOf(bars.bottom, ime.bottom) + gap
                 panel.layoutParams = panelLp
-                if (keyboardOpen) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                if (keyboardOpen) scrollToBottom()
                 ins
             }
         }
@@ -239,6 +239,11 @@ class ChatActivity : Activity() {
 
     private fun dp(v: Float): Float = v * resources.displayMetrics.density
 
+    /** Scroll to the newest message WITHOUT moving focus (fullScroll() steals focus from the input box). */
+    private fun scrollToBottom() {
+        scroll.post { scroll.scrollTo(0, maxOf(0, messages.height - scroll.height)) }
+    }
+
     private fun addBubble(text: String, fromUser: Boolean, isError: Boolean = false): TextView {
         val tv = TextView(this).apply {
             textSize = 15f
@@ -258,7 +263,7 @@ class ChatActivity : Activity() {
             if (fromUser) leftMargin = dp(48) else rightMargin = dp(24)
         }
         messages.addView(tv, lp)
-        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        scrollToBottom()
         return tv
     }
 
