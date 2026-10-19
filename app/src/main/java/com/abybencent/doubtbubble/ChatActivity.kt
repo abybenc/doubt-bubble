@@ -6,12 +6,14 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.text.Html
 import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
 import android.view.View
+import android.view.WindowInsets
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
@@ -32,6 +34,7 @@ class ChatActivity : Activity() {
     companion object {
         const val EXTRA_SCREENSHOT = "screenshot"
         const val EXTRA_STAMP = "stamp"
+        const val EXTRA_TEXT_FILE = "text_file"
         private const val ACCENT = "#3D5AFE"
     }
 
@@ -43,7 +46,8 @@ class ChatActivity : Activity() {
     private lateinit var chips: LinearLayout
 
     private var screenshotB64: String? = null
-    private var imageSent = false
+    private var screenText: String? = null
+    private var contextSent = false
     private val history = JSONArray()
     private var busy = false
     private var lastStamp = 0L
@@ -62,7 +66,7 @@ class ChatActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
-        BubbleService.showBubble(this)
+        BubbleService.showBubble()
     }
 
     /** Each tap on the bubble = fresh screenshot = fresh conversation. */
@@ -73,8 +77,11 @@ class ChatActivity : Activity() {
 
         messages.removeAllViews()
         while (history.length() > 0) history.remove(history.length() - 1)
-        imageSent = false
+        contextSent = false
         screenshotB64 = null
+        screenText = i.getStringExtra(EXTRA_TEXT_FILE)?.let { f ->
+            runCatching { File(f).readText() }.getOrNull()?.takeIf { it.isNotBlank() }
+        }
         busy = false
         sendBtn.isEnabled = true
         chips.visibility = View.VISIBLE
@@ -93,8 +100,11 @@ class ChatActivity : Activity() {
             addBubble("Add your Gemini API key first. Open the Doubt Bubble app, paste the key, then come back.", false)
         } else {
             addBubble(
-                if (screenshotB64 != null) "I can see your screen. What's your doubt?"
-                else "Couldn't capture the screen this time, but ask away.", false
+                when {
+                    screenshotB64 != null -> "I can see your screen. What's your doubt?"
+                    screenText != null -> "I've read the text on your screen (this app blocks screenshots). What's your doubt?"
+                    else -> "Couldn't read the screen this time, but ask away."
+                }, false
             )
         }
         input.setText("")
@@ -110,15 +120,34 @@ class ChatActivity : Activity() {
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setPadding(dp(16), dp(12), dp(16), dp(14))
             background = GradientDrawable().apply {
                 setColor(Color.WHITE)
-                cornerRadii = floatArrayOf(dp(22f), dp(22f), dp(22f), dp(22f), 0f, 0f, 0f, 0f)
+                cornerRadius = dp(22f)
             }
+            elevation = dp(8f)
             isClickable = true // don't pass taps to root
         }
-        val panelHeight = (resources.displayMetrics.heightPixels * 0.72).toInt()
-        root.addView(panel, FrameLayout.LayoutParams(MATCH_PARENT, panelHeight, Gravity.BOTTOM))
+        // Floating card: gap on all sides, always above the nav buttons and the keyboard.
+        val gap = dp(12)
+        val panelLp = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.BOTTOM).apply {
+            setMargins(gap, (resources.displayMetrics.heightPixels * 0.26).toInt(), gap, gap + dp(48))
+        }
+        root.addView(panel, panelLp)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false) // we handle the system bars + keyboard ourselves
+            root.setOnApplyWindowInsetsListener { v, ins ->
+                val bars = ins.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                val ime = ins.getInsets(WindowInsets.Type.ime())
+                val keyboardOpen = ins.isVisible(WindowInsets.Type.ime())
+                val h = if (v.height > 0) v.height else resources.displayMetrics.heightPixels
+                panelLp.topMargin = if (keyboardOpen) bars.top + gap else maxOf(bars.top + gap, (h * 0.26).toInt())
+                panelLp.bottomMargin = maxOf(bars.bottom, ime.bottom) + gap
+                panel.layoutParams = panelLp
+                if (keyboardOpen) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                ins
+            }
+        }
 
         // drag handle
         panel.addView(View(this).apply {
@@ -250,9 +279,8 @@ class ChatActivity : Activity() {
         addBubble(q, true)
         val thinking = addBubble("Thinking…", false)
 
-        val img = screenshotB64
-        val withImage = !imageSent && img != null
-        val turn = if (withImage) GeminiClient.userTextWithImage(q, img!!) else GeminiClient.userText(q)
+        val withContext = !contextSent
+        val turn = if (withContext) GeminiClient.firstTurn(q, screenshotB64, screenText) else GeminiClient.userText(q)
         history.put(turn)
         val model = Prefs.model(this)
         val session = lastStamp
@@ -264,7 +292,7 @@ class ChatActivity : Activity() {
                 if (isDestroyed || session != lastStamp) return@runOnUiThread
                 messages.removeView(thinking)
                 result.onSuccess { answer ->
-                    if (withImage) imageSent = true
+                    if (withContext) contextSent = true
                     history.put(GeminiClient.modelText(answer))
                     addBubble(answer, false)
                 }.onFailure { e ->

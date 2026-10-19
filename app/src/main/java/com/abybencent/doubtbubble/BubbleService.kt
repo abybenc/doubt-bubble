@@ -1,37 +1,32 @@
 package com.abybencent.doubtbubble
 
+import android.accessibilityservice.AccessibilityService
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
-import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
-import android.os.HandlerThread
-import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -40,163 +35,85 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Keeps the floating "?" bubble on screen and a live screen-capture session.
- * Tap the bubble -> it hides itself, grabs the current screen, opens the chat panel.
+ * The heart of Doubt Bubble. Runs as an Accessibility service so it can:
+ *  - float the "?" bubble over any app (no extra overlay permission needed),
+ *  - take a screenshot of exactly what's on screen right now, and
+ *  - read the on-screen text (works even when an app blocks screenshots).
+ * The bubble is hidden until summoned from the notification or Quick Settings tile.
  */
-class BubbleService : Service() {
+class BubbleService : AccessibilityService() {
 
     companion object {
-        const val EXTRA_RESULT_CODE = "result_code"
-        const val EXTRA_DATA = "data"
-        const val ACTION_STOP = "com.abybencent.doubtbubble.STOP"
-        const val ACTION_SHOW = "com.abybencent.doubtbubble.SHOW"
         private const val CHANNEL_ID = "bubble"
         private const val NOTIF_ID = 1
         private const val MAX_IMAGE_SIDE = 1600
+        private const val MAX_TEXT_CHARS = 12000
 
         @Volatile
-        var isRunning = false
+        var instance: BubbleService? = null
             private set
 
-        fun showBubble(context: Context) {
-            if (!isRunning) return
-            context.startService(Intent(context, BubbleService::class.java).setAction(ACTION_SHOW))
-        }
+        val isRunning: Boolean get() = instance != null
+
+        /** Called from the notification / tile / chat panel. Safe to call from the main thread. */
+        fun showBubble() { instance?.showBubbleInternal() }
+
+        fun turnOff() { instance?.disableSelf() }
     }
 
     private lateinit var wm: WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var bgThread: HandlerThread
-    private lateinit var bgHandler: Handler
 
     private var bubble: TextView? = null
     private lateinit var params: WindowManager.LayoutParams
-
-    private var projection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var latestImage: Image? = null // only touched on bgThread
-    private var capW = 0
-    private var capH = 0
     private var capturing = false
 
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onCreate() {
-        super.onCreate()
+    override fun onServiceConnected() {
+        super.onServiceConnected()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        bgThread = HandlerThread("capture").also { it.start() }
-        bgHandler = Handler(bgThread.looper)
+        instance = this
+        createBubble()
         createChannel()
+        postNotification()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            ACTION_SHOW -> {
-                capturing = false
-                showBubble()
-                return START_NOT_STICKY
-            }
-        }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) { /* not needed */ }
 
-        // Must be a foreground service of type mediaProjection BEFORE getMediaProjection().
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIF_ID, buildNotification())
-        }
+    override fun onInterrupt() {}
 
-        if (projection == null) {
-            val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-            val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-                intent?.getParcelableExtra(EXTRA_DATA, Intent::class.java)
-            } else {
-                @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_DATA)
-            }
-            if (data == null) {
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val mp = mpm.getMediaProjection(resultCode, data)
-            if (mp == null) {
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            projection = mp
-            mp.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    // User stopped sharing from the status bar / system UI.
-                    mainHandler.post { stopSelf() }
-                }
-            }, mainHandler)
-            startCapture()
-            createBubble() // created hidden; summon it from the notification or Quick Settings tile
-            isRunning = true
-        }
-        return START_NOT_STICKY
+    override fun onUnbind(intent: Intent?): Boolean {
+        cleanup()
+        return super.onUnbind(intent)
     }
 
-    // ---------- Screen capture ----------
+    override fun onDestroy() {
+        cleanup()
+        super.onDestroy()
+    }
 
-    private fun screenSize(): Triple<Int, Int, Int> {
-        val dpi = resources.displayMetrics.densityDpi
+    private fun cleanup() {
+        if (instance == null) return
+        instance = null
+        hideTrash()
+        bubble?.takeIf { it.isAttachedToWindow }?.let { runCatching { wm.removeView(it) } }
+        bubble = null
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIF_ID)
+    }
+
+    private fun screenSize(): Pair<Int, Int> {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val b = wm.maximumWindowMetrics.bounds
-            Triple(b.width(), b.height(), dpi)
+            Pair(b.width(), b.height())
         } else {
             val m = DisplayMetrics()
             @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(m)
-            Triple(m.widthPixels, m.heightPixels, dpi)
+            Pair(m.widthPixels, m.heightPixels)
         }
-    }
-
-    private fun newReader(w: Int, h: Int): ImageReader {
-        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
-        reader.setOnImageAvailableListener({ r ->
-            val img = try { r.acquireLatestImage() } catch (e: IllegalStateException) { null }
-            if (img != null) {
-                latestImage?.close()
-                latestImage = img
-            }
-        }, bgHandler)
-        return reader
-    }
-
-    private fun startCapture() {
-        val (w, h, dpi) = screenSize()
-        capW = w; capH = h
-        val reader = newReader(w, h)
-        imageReader = reader
-        virtualDisplay = projection?.createVirtualDisplay(
-            "DoubtBubbleCapture", w, h, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface, null, null
-        )
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Rotation: resize the capture so landscape screenshots aren't squashed.
-        val (w, h, dpi) = screenSize()
-        if (w == capW && h == capH) return
-        val vd = virtualDisplay ?: return
-        capW = w; capH = h
-        val newReader = newReader(w, h)
-        val old = imageReader
-        vd.resize(w, h, dpi)
-        vd.surface = newReader.surface
-        imageReader = newReader
-        bgHandler.post {
-            latestImage?.close()
-            latestImage = null
-            old?.close()
-        }
-        // keep bubble on screen after rotation
+        val (w, h) = screenSize()
         bubble?.takeIf { it.isAttachedToWindow }?.let {
             params.x = params.x.coerceIn(0, max(0, w - it.width))
             params.y = params.y.coerceIn(0, max(0, h - it.height))
@@ -204,30 +121,41 @@ class BubbleService : Service() {
         }
     }
 
+    // ---------- Capture: screenshot + on-screen text ----------
+
     private fun captureAndOpenChat() {
         if (capturing) return
         capturing = true
         bubble?.visibility = View.INVISIBLE
-        // Give the screen a moment to redraw without the bubble, then grab the newest frame.
-        bgHandler.postDelayed({
-            val path = latestImage?.let { img ->
-                runCatching { saveImage(img) }.getOrNull()
+        // Let the screen redraw without the bubble, then grab it.
+        mainHandler.postDelayed({
+            val text = runCatching { collectScreenText() }.getOrDefault("")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                    override fun onSuccess(result: ScreenshotResult) {
+                        Thread {
+                            val path = runCatching { saveScreenshot(result) }.getOrNull()
+                            mainHandler.post { openChat(path, text) }
+                        }.start()
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        openChat(null, text)
+                    }
+                })
+            } else {
+                openChat(null, text) // Android 10 and older: text only
             }
-            mainHandler.post { openChat(path) }
-        }, 300)
+        }, 250)
     }
 
-    private fun saveImage(img: Image): String {
-        val plane = img.planes[0]
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * img.width
-        val padded = Bitmap.createBitmap(img.width + rowPadding / pixelStride, img.height, Bitmap.Config.ARGB_8888)
-        buffer.rewind()
-        padded.copyPixelsFromBuffer(buffer)
-        var bmp = Bitmap.createBitmap(padded, 0, 0, img.width, img.height)
-        if (bmp !== padded) padded.recycle()
+    private fun saveScreenshot(result: ScreenshotResult): String? {
+        val hb = result.hardwareBuffer
+        val hw = Bitmap.wrapHardwareBuffer(hb, result.colorSpace)
+        var bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+        hw?.recycle()
+        hb.close()
+        if (bmp == null) return null
 
         val longSide = max(bmp.width, bmp.height)
         if (longSide > MAX_IMAGE_SIDE) {
@@ -236,31 +164,77 @@ class BubbleService : Service() {
             bmp.recycle()
             bmp = scaled
         }
+        val out: Bitmap = bmp
+        cacheDir.listFiles { f -> f.name.startsWith("screen_") && f.name.endsWith(".jpg") }?.forEach { it.delete() }
         val file = File(cacheDir, "screen_${System.currentTimeMillis()}.jpg")
-        cacheDir.listFiles { f -> f.name.startsWith("screen_") }?.forEach { it.delete() }
-        FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
-        bmp.recycle()
+        FileOutputStream(file).use { out.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+        out.recycle()
         return file.absolutePath
     }
 
-    private fun openChat(path: String?) {
-        if (path == null) {
-            Toast.makeText(this, "Couldn't capture the screen. You can still type your doubt.", Toast.LENGTH_SHORT).show()
+    /** Reads the visible text of the app(s) on screen, skipping our own bubble and system UI. */
+    private fun collectScreenText(): String {
+        val sb = StringBuilder()
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        runCatching {
+            windows.filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+                .mapNotNullTo(roots) { it.root }
+        }
+        if (roots.isEmpty()) rootInActiveWindow?.let { roots += it }
+
+        for (root in roots) {
+            val pkg = root.packageName?.toString() ?: continue
+            if (pkg == packageName) continue
+            sb.append("[App: ").append(appLabel(pkg)).append("]\n")
+            walk(root, sb, 0)
+            if (sb.length >= MAX_TEXT_CHARS) break
+        }
+        return sb.toString().take(MAX_TEXT_CHARS).trim()
+    }
+
+    private fun walk(node: AccessibilityNodeInfo, sb: StringBuilder, depth: Int) {
+        if (depth > 80 || sb.length >= MAX_TEXT_CHARS || !node.isVisibleToUser) return
+        val t = (node.text ?: node.contentDescription)?.toString()?.trim()
+        if (!t.isNullOrEmpty() && !sb.endsWith(t + "\n")) sb.append(t).append('\n')
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            walk(child, sb, depth + 1)
+        }
+    }
+
+    private fun appLabel(pkg: String): String = runCatching {
+        packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+    }.getOrDefault(pkg)
+
+    private fun openChat(screenshotPath: String?, screenText: String) {
+        val textFile = File(cacheDir, "screen_text.txt")
+        runCatching { textFile.writeText(screenText) }
+        if (screenshotPath == null && screenText.isBlank()) {
+            Toast.makeText(this, "Couldn't read this screen. You can still type your doubt.", Toast.LENGTH_SHORT).show()
         }
         val i = Intent(this, ChatActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            .putExtra(ChatActivity.EXTRA_SCREENSHOT, path)
+            .putExtra(ChatActivity.EXTRA_SCREENSHOT, screenshotPath)
+            .putExtra(ChatActivity.EXTRA_TEXT_FILE, textFile.absolutePath)
             .putExtra(ChatActivity.EXTRA_STAMP, System.currentTimeMillis())
         try {
             startActivity(i)
         } catch (e: Exception) {
             bubble?.visibility = View.VISIBLE
-            capturing = false
             Toast.makeText(this, "Couldn't open chat: ${e.message}", Toast.LENGTH_LONG).show()
         }
+        capturing = false
     }
 
     // ---------- Floating bubble ----------
+
+    private fun overlayParams(w: Int, h: Int, touchable: Boolean) = WindowManager.LayoutParams(
+        w, h,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+        PixelFormat.TRANSLUCENT
+    )
 
     @SuppressLint("ClickableViewAccessibility")
     private fun createBubble() {
@@ -279,12 +253,7 @@ class BubbleService : Service() {
             alpha = 0.92f
             contentDescription = "Ask a doubt"
         }
-        params = WindowManager.LayoutParams(
-            size, size,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
+        params = overlayParams(size, size, true).apply { gravity = Gravity.TOP or Gravity.START }
         resetPosition()
 
         val slop = ViewConfiguration.get(this).scaledTouchSlop
@@ -308,8 +277,9 @@ class BubbleService : Service() {
                         val near = isNearTrash(e.rawX, e.rawY)
                         if (near != overTrash) {
                             overTrash = near
-                            trash?.animate()?.scaleX(if (near) 1.3f else 1f)?.scaleY(if (near) 1.3f else 1f)?.setDuration(120)?.start()
-                            if (near) v.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                            val s = if (near) 1.3f else 1f
+                            trash?.animate()?.scaleX(s)?.scaleY(s)?.setDuration(120)?.start()
+                            if (near) v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                         }
                         if (near) {
                             magnetToTrash(v)
@@ -336,14 +306,14 @@ class BubbleService : Service() {
     }
 
     private fun resetPosition() {
-        val (w, h, _) = screenSize()
+        val (w, h) = screenSize()
         params.x = w - dp(56) - dp(4)
         params.y = h / 3
     }
 
-    /** Put the bubble on screen (from the notification, the Quick Settings tile, or after the chat closes). */
-    private fun showBubble() {
+    private fun showBubbleInternal() {
         val v = bubble ?: return
+        capturing = false
         v.animate().cancel()
         v.visibility = View.VISIBLE
         v.scaleX = 1f; v.scaleY = 1f; v.alpha = 0.92f
@@ -355,7 +325,6 @@ class BubbleService : Service() {
         }
     }
 
-    /** Remove the bubble from the screen. The service keeps running, so it can be summoned again. */
     private fun hideBubble() {
         val v = bubble ?: return
         if (v.isAttachedToWindow) runCatching { wm.removeView(v) }
@@ -368,9 +337,9 @@ class BubbleService : Service() {
     }
 
     private fun snapToEdge(v: View) {
-        val (w, h, _) = screenSize()
+        val (w, h) = screenSize()
         val targetX = if (params.x + v.width / 2 < w / 2) dp(4) else w - v.width - dp(4)
-        params.y = params.y.coerceIn(dp(24), max(dp(24), h - v.height - dp(48)))
+        params.y = params.y.coerceIn(dp(24), max(dp(24), h - v.height - dp(96)))
         ValueAnimator.ofInt(params.x, targetX).apply {
             duration = 180
             addUpdateListener {
@@ -401,14 +370,9 @@ class BubbleService : Service() {
             alpha = 0f
             translationY = dp(40).toFloat()
         }
-        val lp = WindowManager.LayoutParams(
-            size, size,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
+        val lp = overlayParams(size, size, false).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = dp(72)
+            y = dp(96)
         }
         runCatching { wm.addView(t, lp) }
         t.animate().alpha(1f).translationY(0f).setDuration(160).start()
@@ -434,15 +398,14 @@ class BubbleService : Service() {
     private fun isNearTrash(x: Float, y: Float): Boolean {
         val (cx, cy) = trashCenter() ?: return false
         val dx = x - cx; val dy = y - cy
-        return dx * dx + dy * dy < dp(80).toFloat() * dp(80)
+        val r = dp(80).toFloat()
+        return dx * dx + dy * dy < r * r
     }
 
-    /** Pull the bubble onto the target so it "sticks", Messenger style. */
     private fun magnetToTrash(v: View) {
         val (cx, cy) = trashCenter() ?: return
         val loc = IntArray(2)
         v.getLocationOnScreen(loc)
-        // offset between window params and real screen position (status bar, cutouts)
         val offX = loc[0] - params.x
         val offY = loc[1] - params.y
         params.x = (cx - v.width / 2f).toInt() - offX
@@ -453,8 +416,7 @@ class BubbleService : Service() {
     // ---------- Notification ----------
 
     private fun createChannel() {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Doubt Bubble", NotificationManager.IMPORTANCE_LOW).apply {
                 description = "Tap to bring up the doubt bubble"
                 setShowBadge(false)
@@ -462,16 +424,21 @@ class BubbleService : Service() {
         )
     }
 
-    private fun buildNotification(): Notification {
+    private fun postNotification() {
         val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        val stop = PendingIntent.getService(this, 1, Intent(this, BubbleService::class.java).setAction(ACTION_STOP), flags)
-        // Goes through a tiny invisible activity so the notification shade closes before the bubble appears.
         val show = PendingIntent.getActivity(
             this, 2,
             Intent(this, ShowBubbleActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             flags
         )
-        return Notification.Builder(this, CHANNEL_ID)
+        val off = PendingIntent.getActivity(
+            this, 1,
+            Intent(this, ShowBubbleActivity::class.java)
+                .setAction(ShowBubbleActivity.ACTION_TURN_OFF)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            flags
+        )
+        val n = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notify)
             .setContentTitle("Got a doubt?")
             .setContentText("Tap to bring up the bubble")
@@ -479,27 +446,8 @@ class BubbleService : Service() {
             .setOngoing(true)
             .setShowWhen(false)
             .addAction(Notification.Action.Builder(null, "Show bubble", show).build())
-            .addAction(Notification.Action.Builder(null, "Turn off", stop).build())
+            .addAction(Notification.Action.Builder(null, "Turn off", off).build())
             .build()
-    }
-
-    override fun onDestroy() {
-        isRunning = false
-        hideTrash()
-        bubble?.takeIf { it.isAttachedToWindow }?.let { runCatching { wm.removeView(it) } }
-        bubble = null
-        runCatching { virtualDisplay?.release() }
-        virtualDisplay = null
-        runCatching { projection?.stop() }
-        projection = null
-        val reader = imageReader
-        imageReader = null
-        bgHandler.post {
-            latestImage?.close()
-            latestImage = null
-            reader?.close()
-            bgThread.quitSafely()
-        }
-        super.onDestroy()
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, n) }
     }
 }

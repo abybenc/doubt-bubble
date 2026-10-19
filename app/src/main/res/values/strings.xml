@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Doubt Bubble</string>
+    <string name="a11y_summary">Floating ? bubble that answers doubts about what\'s on your screen</string>
+    <string name="a11y_description">Doubt Bubble uses this permission only when you tap the ? bubble: it takes a screenshot and reads the text currently on your screen, then sends them with your question to Google Gemini. Nothing is read or sent at any other time.</string>
 </resources>

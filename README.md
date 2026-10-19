@@ -11,9 +11,8 @@ your question about what you were reading.
 2. Open the file and allow "Install unknown apps" for your browser when Android asks.
 3. Open **Doubt Bubble**, tap **Get a free key**, create a Gemini API key in Google AI Studio,
    paste it, tap **Save**.
-4. Tap **Turn on** and allow:
-   - **Display over other apps** (so the bubble can float)
-   - **Screen sharing** (pick **Entire screen** if asked)
+4. Tap **Turn on**, allow notifications, then switch **Doubt Bubble** on in Accessibility settings.
+   - Switch greyed out ("Restricted setting")? App info → ⋮ → **Allow restricted settings**, then try again.
 
 ## Using it
 
@@ -30,7 +29,7 @@ your question about what you were reading.
 | Piece | File |
 |---|---|
 | Setup screen (key, permissions) | `MainActivity.kt` |
-| Floating bubble, throw-away target, screen capture | `BubbleService.kt` |
+| Accessibility service: bubble, throw-away target, screenshot + screen text | `BubbleService.kt` |
 | Notification / tile shortcut that summons the bubble | `ShowBubbleActivity.kt`, `BubbleTileService.kt` |
 | Chat panel that slides up over any app | `ChatActivity.kt` |
 | Gemini REST call (no extra libraries) | `GeminiClient.kt` |
@@ -39,7 +38,7 @@ Model defaults to `gemini-flash-latest`; you can change it in the app if Google 
 
 ## Notes
 
-- Apps that block screenshots (banking, some streaming apps) will show a black capture.
+- Apps that block screenshots (banking, some streaming apps) give a blank image, but their on-screen text is still read and sent.
 - `app/doubtbubble.keystore` is a personal signing key committed on purpose so each new build
   installs over the old one. Fine for personal sideloading; don't use it for Play Store.
 - Your API key stays on the phone (app-private storage) and is sent only to Google's Gemini API.

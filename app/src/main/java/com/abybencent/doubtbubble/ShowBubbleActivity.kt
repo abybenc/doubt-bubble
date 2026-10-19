@@ -9,13 +9,18 @@ import android.os.Bundle
  * Opening an activity makes Android close the notification shade, then we pop the bubble and vanish.
  */
 class ShowBubbleActivity : Activity() {
+
+    companion object {
+        const val ACTION_TURN_OFF = "com.abybencent.doubtbubble.TURN_OFF"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (BubbleService.isRunning) {
-            startService(Intent(this, BubbleService::class.java).setAction(BubbleService.ACTION_SHOW))
-        } else {
-            // Bubble service isn't on (e.g. phone restarted): open setup so they can turn it on.
-            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        when {
+            intent?.action == ACTION_TURN_OFF -> BubbleService.turnOff()
+            BubbleService.isRunning -> BubbleService.showBubble()
+            // Not switched on (e.g. Accessibility toggle got reset): open setup.
+            else -> startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
         finish()
         @Suppress("DEPRECATION")

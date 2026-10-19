@@ -7,12 +7,12 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
+import android.view.WindowInsets
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
@@ -26,7 +26,6 @@ import android.widget.Toast
 class MainActivity : Activity() {
 
     companion object {
-        private const val REQ_CAPTURE = 42
         private const val REQ_NOTIF = 43
         private const val ACCENT = "#3D5AFE"
     }
@@ -43,12 +42,21 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(22), dp(28), dp(22), dp(28))
         }
-        setContentView(ScrollView(this).apply { addView(col) })
+        val scrollRoot = ScrollView(this).apply { addView(col) }
+        setContentView(scrollRoot)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 15 draws edge-to-edge: keep content clear of the status bar and nav buttons.
+            scrollRoot.setOnApplyWindowInsetsListener { _, ins ->
+                val bars = ins.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                col.setPadding(dp(22), bars.top + dp(20), dp(22), bars.bottom + dp(28))
+                ins
+            }
+        }
 
         col.addView(text("Doubt Bubble", 28f, bold = true))
         col.addView(text(
-            "Reading something and got a doubt? Pull down your notifications, tap Doubt Bubble, " +
-                "then tap the ? bubble. It snaps your screen and you can ask Gemini about it right there.",
+            "Reading something and got a doubt? Pull down your notifications, tap \"Got a doubt?\", " +
+                "then tap the ? bubble. It reads your screen and you can ask Gemini about it right there.",
             15f, color = "#555A6B", top = 6
         ))
 
@@ -72,14 +80,24 @@ class MainActivity : Activity() {
 
         col.addView(text("2. Turn it on (once)", 17f, bold = true, top = 28))
         col.addView(text(
-            "You'll be asked for two permissions: \"Display over other apps\" (for the bubble) and " +
-                "screen sharing (so it can see what you're reading). If Android asks, choose \"Entire screen\".",
+            "Doubt Bubble uses Android's Accessibility permission so it can read exactly what's on your screen " +
+                "when you tap the bubble. Nothing is read at any other time.\n\n" +
+                "Tap Turn on → find Doubt Bubble (often under \"Downloaded apps\" or \"Installed apps\") → switch it on.",
             14f, color = "#555A6B", top = 4
         ))
         startBtn = button("Turn on") { startFlow() }
         col.addView(startBtn)
+        col.addView(text(
+            "Switch greyed out or says \"Restricted setting\"? Android does that for apps installed outside the " +
+                "Play Store. Tap below → ⋮ (top right) → Allow restricted settings, then try Turn on again.",
+            13f, color = "#555A6B", top = 12
+        ))
+        col.addView(button("Fix greyed-out switch", outline = true) {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        })
         col.addView(button("Turn off", outline = true) {
-            startService(Intent(this, BubbleService::class.java).setAction(BubbleService.ACTION_STOP))
+            if (BubbleService.isRunning) BubbleService.turnOff()
+            else Toast.makeText(this, "It's already off", Toast.LENGTH_SHORT).show()
             status.postDelayed({ refresh() }, 300)
         })
         status = text("", 14f, color = "#555A6B", top = 14)
@@ -87,12 +105,12 @@ class MainActivity : Activity() {
 
         col.addView(text("Tips", 17f, bold = true, top = 28))
         col.addView(text(
-            "• The bubble stays hidden until you need it. Summon it from the notification.\n" +
+            "• The bubble stays hidden until you need it. Summon it from the \"Got a doubt?\" notification.\n" +
                 "• Even faster: edit your Quick Settings and add the \"Ask a doubt\" tile.\n" +
                 "• Done with it? Drag the bubble down onto the ✕ to throw it away.\n" +
                 "• Drag it anywhere else and it sticks to the nearest edge.\n" +
                 "• Tap the small screenshot in the chat to see what was captured.\n" +
-                "• Banking and some secure apps block screenshots, so the capture will be black there.\n" +
+                "• Apps that block screenshots (banking, some news/streaming apps) still work: it reads their text instead.\n" +
                 "• To switch everything off, tap Turn off in the notification.",
             14f, color = "#555A6B", top = 4
         ))
@@ -106,14 +124,15 @@ class MainActivity : Activity() {
     private fun refresh() {
         val parts = mutableListOf<String>()
         parts += if (Prefs.apiKey(this).isBlank()) "API key: missing" else "API key: saved"
-        parts += if (Settings.canDrawOverlays(this)) "Overlay permission: granted" else "Overlay permission: not yet"
+        parts += if (Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        ) "Notifications: allowed" else "Notifications: not allowed (needed to summon the bubble)"
         parts += if (BubbleService.isRunning) "Doubt Bubble: ON (waiting in your notifications)" else "Doubt Bubble: off"
         status.text = parts.joinToString("\n")
-        startBtn.text = if (BubbleService.isRunning) "It's on" else "Turn on"
+        startBtn.text = if (BubbleService.isRunning) "It's on ✓" else "Turn on"
     }
 
     private fun startFlow() {
-        // save whatever is typed, so they don't lose it
         Prefs.save(this, keyInput.text.toString(), modelInput.text.toString())
         if (Prefs.apiKey(this).isBlank()) {
             Toast.makeText(this, "Paste your Gemini API key first", Toast.LENGTH_SHORT).show()
@@ -123,46 +142,23 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Already on. Pull down notifications to summon the bubble", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Allow \"Display over other apps\", then come back and tap Start again", Toast.LENGTH_LONG).show()
-            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-            return
-        }
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
-            return // continue in onRequestPermissionsResult
+            return // continues in onRequestPermissionsResult
         }
-        askScreenCapture()
+        openAccessibilitySettings()
     }
 
-    private fun askScreenCapture() {
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        @Suppress("DEPRECATION")
-        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
+    private fun openAccessibilitySettings() {
+        Toast.makeText(this, "Find Doubt Bubble and switch it on", Toast.LENGTH_LONG).show()
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_NOTIF) askScreenCapture() // works even if they said no to notifications
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        @Suppress("DEPRECATION")
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQ_CAPTURE) return
-        if (resultCode != RESULT_OK || data == null) {
-            Toast.makeText(this, "Screen sharing is needed so the bubble can see what you're reading", Toast.LENGTH_LONG).show()
-            return
-        }
-        val svc = Intent(this, BubbleService::class.java)
-            .putExtra(BubbleService.EXTRA_RESULT_CODE, resultCode)
-            .putExtra(BubbleService.EXTRA_DATA, data)
-        startForegroundService(svc)
-        Toast.makeText(this, "Ready! Pull down notifications and tap Doubt Bubble whenever you have a doubt", Toast.LENGTH_LONG).show()
-        moveTaskToBack(true)
+        if (requestCode == REQ_NOTIF) openAccessibilitySettings()
     }
 
     // ---------- tiny view helpers ----------

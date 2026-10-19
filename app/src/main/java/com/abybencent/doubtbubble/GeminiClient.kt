@@ -11,7 +11,8 @@ object GeminiClient {
 
     const val SYSTEM_PROMPT =
         "You are a friendly study buddy living in a floating bubble on the user's Android phone. " +
-            "The first message includes a screenshot of whatever the user was reading when they had a doubt. " +
+            "The first message includes a screenshot of whatever the user was reading when they had a doubt, " +
+            "plus the text read from that screen (it may include menus or ads; focus on the main content). " +
             "Answer their question about what is on that screen. Use simple, clear English and everyday examples. " +
             "Keep answers short (a few sentences or a short list) unless they ask for more detail. " +
             "If the screenshot is unclear or does not contain what they ask about, say so and answer from general knowledge."
@@ -20,12 +21,18 @@ object GeminiClient {
         JSONObject().put("role", "user")
             .put("parts", JSONArray().put(JSONObject().put("text", text)))
 
-    fun userTextWithImage(text: String, jpegBase64: String): JSONObject =
-        JSONObject().put("role", "user").put(
-            "parts", JSONArray()
-                .put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", jpegBase64)))
-                .put(JSONObject().put("text", text))
-        )
+    /** First question of a session: screenshot (if any) + screen text (if any) + the question. */
+    fun firstTurn(question: String, jpegBase64: String?, screenText: String?): JSONObject {
+        val parts = JSONArray()
+        if (jpegBase64 != null) {
+            parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", jpegBase64)))
+        }
+        if (!screenText.isNullOrBlank()) {
+            parts.put(JSONObject().put("text", "Text on my screen:\n\"\"\"\n$screenText\n\"\"\""))
+        }
+        parts.put(JSONObject().put("text", "My doubt: $question"))
+        return JSONObject().put("role", "user").put("parts", parts)
+    }
 
     fun modelText(text: String): JSONObject =
         JSONObject().put("role", "model")
